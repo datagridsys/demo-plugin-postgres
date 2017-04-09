@@ -1,0 +1,102 @@
+from __future__ import print_function
+import time
+import sys
+import psycopg2
+
+import skpp
+
+
+# define user error exception
+
+class UserError(Exception):
+    pass
+
+# === misc helpers
+
+def ping(host, port, timeout):
+    conn = psycopg2.connect(user='postgres', host=host, port=port)
+    cur = conn.cursor()
+    cur.execute("SELECT datname FROM pg_database WHERE datistemplate = false;")
+    conn.close()
+
+def extract_ip(inst):
+    """
+    Extract IP address of the instance (inst must be a dict containing
+    the Skopos inst{} structure for a single instance)
+    Return the IP address of the instance as a string
+    Raise UserError exception if there is no IP address for the instance
+    """
+
+    # extract IP
+    ip = inst.get('ipaddr')
+    if not ip:  # none or empty
+        raise UserError('plugin action requires valid instance IP address, got "{}"'.format(ip))
+
+    return ip
+
+# === operations
+
+def _request(host, port = 5432, timeout = 120, **dummy):
+
+    try:
+        ping(host, int(port), timeout)
+    except Exception as e:
+        raise UserError("Error connecting or getting PING from redis %s:%s: %s" % (host, port, e))
+    return
+
+def _wait_request(timeout = 120, **args):
+    #_dbg_log("wait_request", timeout, args)
+    timeout = int(timeout)  # make sure it is an integer so we can compare
+    start = time.time()
+    while True:
+        tstamp = time.time() # measure before we start but compare after
+
+        # try the request & check result against ok_codes
+        # any non-request errors will be raised immediately (e.g., KeyError)
+        exc = None
+        try:
+            _request(timeout=10, **args)
+        except UserError as e:  # we got not the response we wanted
+            exc = e
+            pass
+        else:
+            return # success!
+
+        # continue if still within the timeout
+        if tstamp >= start + timeout:
+            # ok, we will fail since we've tried at least once after the timeout period
+            raise exc if exc else UserError('Timed out waiting for success response')
+
+        # delay next request (avoid busy loop)
+        time.sleep(1)
+
+        # continue and try again
+
+# === action handlers
+
+def _dbg_log(*args):
+    with open('/tmp/skopos-verify-redis-postgres-plugin.log', 'a') as f:
+        f.write(' '.join([str(x) for x in args] + [ '\n', ]))
+
+def _check_ok(project, inst=[], **args):
+    # execute for each instance (no op if no instances, fail on first failure)
+    for i in inst:
+        _wait_request(host=extract_ip(i), **args)
+    return
+
+# === Skopos plugin action wrappers
+
+@skpp.action
+def check_ok(**args):
+    try:
+        _check_ok(**args)
+    except UserError as e:
+        print('Error:', str(e), file=sys.stderr)
+        sys.exit(1)
+
+    return args
+
+# === Main
+
+if __name__ == "__main__":
+    skpp.run('verify_redis', globals())
